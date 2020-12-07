@@ -1,12 +1,13 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
+	"time"
 )
 
 type TaskState int8
@@ -18,55 +19,166 @@ const (
 )
 
 type Task struct {
-	State    TaskState
-	WorkerID *string
+	State             TaskState
+	Number            int
+	WorkerID          string
+	IntermediateFiles []string
+	TimeStarted       time.Time
 }
 
 type Master struct {
 	// Your definitions here.
-	Tasks   map[Task]bool
-	Files   []string
-	NReduce int
+	MapTasks       []Task
+	ReduceTasks    []Task
+	Files          []string
+	NReduce        int
+	MaxTimeWaiting time.Duration
 }
 
-var times = 0
-var interFiles = []string{}
+var mapMux, reduceMux sync.Mutex
 
-// Your code here -- RPC handlers for the worker to call.
+func (m *Master) handleCrashes() {
+	mapMux.Lock()
+	for i := range m.MapTasks {
+		if m.MapTasks[i].State == InProgress {
+			if m.MapTasks[i].TimeStarted.Add(m.MaxTimeWaiting).Before(time.Now().UTC()) {
+				m.MapTasks[i] = Task{
+					State:  Idle,
+					Number: m.MapTasks[i].Number,
+				}
+			}
+		}
+	}
+	mapMux.Unlock()
+
+	reduceMux.Lock()
+	for i := range m.ReduceTasks {
+		if m.ReduceTasks[i].State == InProgress {
+			if m.ReduceTasks[i].TimeStarted.Add(m.MaxTimeWaiting).Before(time.Now().UTC()) {
+				m.ReduceTasks[i] = Task{
+					State:  Idle,
+					Number: m.ReduceTasks[i].Number,
+				}
+			}
+		}
+	}
+	reduceMux.Unlock()
+}
 
 func (m *Master) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) error {
-	if times == 0 {
+
+	m.handleCrashes()
+
+	allMapsDone := true
+	mapMux.Lock()
+	for i, task := range m.MapTasks {
+		if task.State != Idle {
+			if task.State != Completed {
+				allMapsDone = false
+			}
+			continue
+		}
+		m.MapTasks[i] = Task{
+			State:       InProgress,
+			Number:      m.MapTasks[i].Number,
+			WorkerID:    args.WorkerID,
+			TimeStarted: time.Now().UTC(),
+		}
 		reply.OK = true
 		reply.TaskResponse = &TaskReponse{
 			TaskType:  MAP,
-			Number:    0,
+			Number:    m.MapTasks[i].Number,
 			NReduce:   m.NReduce,
-			FileNames: m.Files,
+			FileNames: []string{m.Files[m.MapTasks[i].Number]},
 		}
-	} else if times <= m.NReduce {
-		reply.OK = true
-		reply.TaskResponse = &TaskReponse{
-			TaskType:  REDUCE,
-			Number:    times - 1,
-			NReduce:   m.NReduce,
-			FileNames: interFiles,
-		}
-	} else {
+		mapMux.Unlock()
+		return nil
+	}
+	mapMux.Unlock()
+
+	if !allMapsDone {
 		reply.OK = false
+		reply.TaskResponse = nil
+		return nil
 	}
 
-	times++
+	reduceMux.Lock()
+	for i, task := range m.ReduceTasks {
+		if task.State != Idle {
+			continue
+		}
+		m.ReduceTasks[i] = Task{
+			State:       InProgress,
+			Number:      m.ReduceTasks[i].Number,
+			WorkerID:    args.WorkerID,
+			TimeStarted: time.Now().UTC(),
+		}
+		reply.OK = true
+
+		var files []string
+
+		mapMux.Lock()
+		for _, f := range m.MapTasks {
+			files = append(files, f.IntermediateFiles[m.ReduceTasks[i].Number])
+		}
+		mapMux.Unlock()
+
+		reply.TaskResponse = &TaskReponse{
+			TaskType:  REDUCE,
+			Number:    m.ReduceTasks[i].Number,
+			NReduce:   m.NReduce,
+			FileNames: files,
+		}
+		reduceMux.Unlock()
+		return nil
+	}
+	reduceMux.Unlock()
+	reply.OK = false
+	reply.TaskResponse = nil
 
 	return nil
 }
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (m *Master) DoneWithTask(args *DoneWithTaskArgs, reply *DoneWithTaskReply) error {
+
+	switch args.TaskType {
+	case MAP:
+		mapMux.Lock()
+		for i, t := range m.MapTasks {
+			if t.Number != args.Number {
+				continue
+			}
+			if t.WorkerID == args.WorkerID && t.State == InProgress {
+				m.MapTasks[i].State = Completed
+				m.MapTasks[i].IntermediateFiles = args.FileNames
+				reply.OK = true
+			} else {
+				reply.OK = false
+			}
+			break
+		}
+		mapMux.Unlock()
+		return nil
+	case REDUCE:
+		reduceMux.Lock()
+		for i, t := range m.ReduceTasks {
+			if t.Number != args.Number {
+				continue
+			}
+			if t.WorkerID == args.WorkerID && t.State == InProgress {
+				m.ReduceTasks[i].State = Completed
+				reply.OK = true
+			} else {
+				reply.OK = false
+			}
+			break
+		}
+		reduceMux.Unlock()
+		return nil
+	default:
+		reply.OK = false
+	}
+
 	return nil
 }
 
@@ -91,8 +203,15 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-
-	return times > m.NReduce
+	reduceMux.Lock()
+	for _, t := range m.ReduceTasks {
+		if t.State != Completed {
+			reduceMux.Unlock()
+			return false
+		}
+	}
+	reduceMux.Unlock()
+	return true
 }
 
 //
@@ -102,14 +221,26 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
+
 	m.Files = files
 	m.NReduce = nReduce
+	m.MapTasks = make([]Task, len(files))
+	m.ReduceTasks = make([]Task, m.NReduce)
+	m.MaxTimeWaiting = time.Second * 10
 
-	for i := 0; i < nReduce; i++ {
-		interFiles = append(interFiles, fmt.Sprintf("mr-0-%v", i))
+	for i := range m.MapTasks {
+		m.MapTasks[i] = Task{
+			State:  Idle,
+			Number: i,
+		}
 	}
 
-	// Your code here.
+	for i := range m.ReduceTasks {
+		m.ReduceTasks[i] = Task{
+			State:  Idle,
+			Number: i,
+		}
+	}
 
 	m.server()
 	return &m

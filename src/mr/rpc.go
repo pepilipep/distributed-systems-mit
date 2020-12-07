@@ -49,6 +49,17 @@ type AskForTaskReply struct {
 	TaskResponse *TaskReponse
 }
 
+type DoneWithTaskArgs struct {
+	TaskType  TaskType
+	Number    int
+	WorkerID  string
+	FileNames []string
+}
+
+type DoneWithTaskReply struct {
+	OK bool
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
 // Can't use the current directory since
